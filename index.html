@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <title>SAP LD/DP/Supply/Brand Checker + Summary</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    :root{--pri:#1d4ed8;--mut:#666}
+    body{font-family:system-ui,Arial,sans-serif;padding:24px;max-width:1280px;margin:auto}
+    h1{margin:0 0 8px}
+    .hint{color:#555;margin-bottom:16px}
+    .controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+    input[type=file]{padding:8px;border:1px solid #ddd;border-radius:10px}
+    .btn{padding:9px 14px;border-radius:10px;border:1px solid #1e40af;background:var(--pri);color:#fff;cursor:pointer}
+    .btn.secondary{background:#fff;color:var(--pri)}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    label{display:flex;align-items:center;gap:8px}
+    table{width:100%;border-collapse:collapse;margin-top:14px}
+    th,td{border:1px solid #e5e7eb;padding:6px 8px;text-align:center;font-size:13px}
+    th{background:#f3f4f6}
+    tr.error{background:#ffe2e2}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #ddd}
+    .ok{background:#e8fff0;border-color:#86efac;color:#065f46}
+    .err{background:#ffe2e2;border-color:#fecaca;color:#991b1b}
+    .msg{white-space:pre-wrap;text-align:left}
+    .small{font-size:12px;color:var(--mut)}
+    .warn{background:#fff6d8;border:1px solid #fde68a;padding:8px;border-radius:8px}
+    .subtotal{background:#f0f9ff;font-weight:700}
+  </style>
+</head>
+<body>
+  <h1>ตรวจสอบข้อมูล SAP: LD / DP / Supply Site / Brand</h1>
+  <p class="hint">
+    Export จาก SAP เป็น <b>XLSX</b> หรือ <b>CSV</b>. ต้องมีหัวคอลัมน์อย่างน้อย:
+    <b>LD</b>, <b>DP</b>, <b>Supply Site</b>, <b>Site</b>, <b>Salesperson</b>, <b>Brand</b>, <b>QTY(Order Unit)</b>
+  </p>
+
+  <div class="controls">
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv" />
+    <button class="btn" id="downloadBtn" disabled>ดาวน์โหลดผลตรวจ (.xlsx)</button>
+    <label class="small"><input type="checkbox" id="onlyError"> แสดงเฉพาะ Error (ซ่อน DP=90)</label>
+    <span id="summary" class="small"></span>
+  </div>
+
+  <div id="headerWarn"></div>
+  <div id="result"></div>
+
+  <h2 style="margin-top:28px">สรุปยอด QTY(Order Unit) ตาม <b>Site × LD</b></h2>
+  <div class="controls">
+    <button class="btn secondary" id="downloadSummaryBtn" disabled>ดาวน์โหลดสรุป (.xlsx)</button>
+    <span id="sumHint" class="small"></span>
+  </div>
+  <div id="summaryTable"></div>
+
+<script>
+/* -------------------- 1) Base mapping rules (LD-DP-Supply) -------------------- */
+const baseRules = [
+  [333,[22],3615],
+  [381,[22,23],3615],
+  [311,[13],3110],[331,[13],3110],[351,[13],3110],[378,[13],3110],[431,[13],3110],[432,[13],3110],[471,[13],3110],
+  [303,[12,13],3111],[322,[13],3111],[323,[13],3111],[371,[13],3111],[374,[13],3111],[375,[13],3111],[378,[13],3111],[381,[13],3111],
+  [341,[13],1110],[401,[13],1110],[402,[13],1110],[441,[13],1110],
+  [301,[13],1315],[302,[13],1315],[389,[13],1315],
+  [321,[13],1112],[361,[13],1112],[371,[13],1112],[384,[13],1112],
+  [302,[13],1113],[303,[13],1113],
+];
+
+/* -------------------- 2) Brand rules -------------------- */
+const brandRules = new Map();
+brandRules.set('381-22-3615',{type:'equals',values:['SVC']});
+brandRules.set('381-23-3615',{type:'equals',values:['SVC']});
+brandRules.set('378-13-3110',{type:'in',values:['BEH','JDA','JPN','KHY','KMG','NTM','NTR','OTP','PEA','PLP','RRC','SSS','TGT']});
+brandRules.set('351-13-3110',{type:'notEquals',values:['TVB']});
+brandRules.set('351-13-3111',{type:'equals',values:['TVB']});
+brandRules.set('378-13-3111',{type:'in',values:['AOD','BCN','BDB','BPT','CNI','CSB','CSD','CTB','CTN','CUU','EKA','GOC','GSK','IND','KHW','KMM','KYA','LLF','MPS','NCD','NLH','NMO','NTE','PAW','PDP','PKI','PLE','PMF','PMM','POW','PPS','PRU','PSO','PWK','RUK','SBC','SGK','SRA','SRR','SSL','SUH','SUT','TAY','TIB','TMC','TPC','TUH','WAP']});
+brandRules.set('371-13-3111',{type:'notIn',values:['KMH','KMA']});
+brandRules.set('381-13-3111',{type:'notEquals',values:['SVC']});
+brandRules.set('371-13-1112',{type:'in',values:['KMH','KMA']});
+brandRules.set('302-13-1113',{type:'equals',values:['BAM']});
+brandRules.set('303-13-1113',{type:'equals',values:['CUO']});
+
+/* -------------------- Utils -------------------- */
+const toNum = v => (v===null||v===undefined||v==='') ? null : Number(String(v).replace(/[, ]/g,'').replace(/[^\d.-]/g,''));
+const toUpper = v => (v==null)? '' : String(v).trim().toUpperCase();
+const normToken = s => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,''); // keep a-z0-9
+
+function headerIndex(headers, candidates){
+  const norm = headers.map(normToken);
+  // exact
+  for(const c of candidates){ const i=norm.indexOf(c); if(i!==-1) return i; }
+  // contains
+  for(let i=0;i<norm.length;i++){
+    for(const c of candidates){ if(norm[i].includes(c)) return i; }
+  }
+  return -1;
+}
+
+function isBaseAllowed(LD,DP,SUP){
+  return baseRules.some(([ld,dps,s])=>ld===LD && s===SUP && dps.includes(DP));
+}
+function checkBrandRule(LD,DP,SUP,BRAND){
+  const rule = brandRules.get(`${LD}-${DP}-${SUP}`);
+  if(!rule) return {ok:true,msg:'ผ่าน (ไม่มีเงื่อนไขแบรนด์เพิ่มเติม)'};
+  const val = toUpper(BRAND), vals = rule.values;
+  switch(rule.type){
+    case 'equals':    return vals.includes(val)?{ok:true,msg:`ผ่าน (Brand ต้องเป็น ${vals.join('/')})`}:{ok:false,msg:`Brand ต้องเป็น ${vals.join('/')} (พบ: ${val||'-'})`};
+    case 'in':        return vals.includes(val)?{ok:true,msg:`ผ่าน (Brand อยู่ในรายการที่อนุญาต)`}:{ok:false,msg:`Brand ต้องอยู่ใน: ${vals.join(', ')} (พบ: ${val||'-'})`};
+    case 'notEquals': return !vals.includes(val)?{ok:true,msg:`ผ่าน (ห้ามเป็น ${vals.join('/')})`}:{ok:false,msg:`ห้ามเป็น ${vals.join('/')} (พบ: ${val||'-'})`};
+    case 'notIn':     return !vals.includes(val)?{ok:true,msg:`ผ่าน (ห้ามอยู่ใน: ${vals.join('/')})`}:{ok:false,msg:`ห้ามเป็น ${vals.join('/')} (พบ: ${val||'-'})`};
+    default:          return {ok:true,msg:'ผ่าน'};
+  }
+}
+
+/* -------------------- Header detection -------------------- */
+function findHeaderRow(allRows){
+  const want = [
+    ['ld'],['dp'],['supplysite','supplysit','supply'],['brand'],['site'],
+    ['salesperson','salespersonname','salespersonid','salespersoncode'],
+    ['qtyorderunit','qtyorderunits','qtyorder','qty']
+  ];
+  let bestRow=-1,bestScore=-1;
+  const scan=Math.min(50,allRows.length);
+  for(let r=0;r<scan;r++){
+    const tokens=(allRows[r]||[]).map(normToken);
+    let score=0;
+    if(tokens.some(t=>t==='ld') && tokens.some(t=>t==='dp')) score+=2;
+    for(const cand of want.slice(2)){
+      if(tokens.some(t => cand.some(c => t===c || t.includes(c)))) score+=1;
+    }
+    if(score>bestScore){bestScore=score;bestRow=r;}
+  }
+  return bestRow;
+}
+
+/* -------------------- State & Listeners -------------------- */
+let processed = [];
+let exportMatrix = null;
+let summaryMatrix = null;
+
+document.getElementById('fileInput').addEventListener('change', handleFile);
+document.getElementById('downloadBtn').addEventListener('click', ()=>downloadXlsx(exportMatrix,'sap_check_result.xlsx'));
+document.getElementById('downloadSummaryBtn').addEventListener('click', ()=>downloadXlsx(summaryMatrix,'sap_site_LD_summary.xlsx'));
+document.getElementById('onlyError').addEventListener('change', ()=>renderTable());
+
+function handleFile(e){
+  const f = e.target.files?.[0]; if(!f) return;
+  const reader = new FileReader();
+  reader.onload = ev=>{
+    const wb = XLSX.read(new Uint8Array(ev.target.result),{type:'array'});
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:''});
+    runCheck(rows);
+  };
+  reader.readAsArrayBuffer(f);
+}
+
+/* -------------------- Core -------------------- */
+function runCheck(allRows){
+  const headerRow = findHeaderRow(allRows);
+  if(headerRow < 0){
+    document.getElementById('headerWarn').innerHTML =
+      `<div class="warn">ไม่พบหัวคอลัมน์ใน 50 แถวแรกของชีต โปรดตรวจว่าไฟล์มีหัวคอลัมน์ LD / DP / Supply Site / Brand ฯลฯ</div>`;
+    document.getElementById('result').innerHTML = '';
+    document.getElementById('summaryTable').innerHTML = '';
+    document.getElementById('downloadBtn').disabled = true;
+    document.getElementById('downloadSummaryBtn').disabled = true;
+    return;
+  }
+
+  const headers = allRows[headerRow];
+  const dataRows = allRows.slice(headerRow+1);
+
+  const idxLD    = headerIndex(headers,['ld']);
+  const idxDP    = headerIndex(headers,['dp']);
+  const idxSUP   = headerIndex(headers,['supplysite','supplysit','supply']);
+  const idxBrand = headerIndex(headers,['brand']);
+  const idxSite  = headerIndex(headers,['site']);
+  const idxSales = headerIndex(headers,['salesperson','salespersonname','salespersonid','salespersoncode','salesperson_']);
+  const idxQty   = headerIndex(headers,['qtyorderunit','qtyorderunits','qtyorder','qty']);
+
+  const missing=[];
+  if(idxLD<0) missing.push('LD');
+  if(idxDP<0) missing.push('DP');
+  if(idxSUP<0) missing.push('Supply Site');
+  if(idxSite<0) missing.push('Site');
+  if(idxSales<0) missing.push('Salesperson');
+  if(idxBrand<0) missing.push('Brand');
+  if(idxQty<0) missing.push('QTY(Order Unit)');
+
+  if(missing.length){
+    document.getElementById('headerWarn').innerHTML =
+      `<div class="warn">พบหัวตารางที่แถว ${headerRow+1} แต่ยังขาดคอลัมน์: <b>${missing.join(', ')}</b></div>`;
+    document.getElementById('result').innerHTML = '';
+    document.getElementById('summaryTable').innerHTML = '';
+    document.getElementById('downloadBtn').disabled = true;
+    document.getElementById('downloadSummaryBtn').disabled = true;
+    return;
+  }else{
+    document.getElementById('headerWarn').innerHTML = '';
+  }
+
+  processed = [];
+  let okCount=0, errCount=0;
+
+  for(const row of dataRows){
+    const LD    = toNum(row[idxLD]);
+    const DP    = toNum(row[idxDP]);
+    const SUP   = toNum(row[idxSUP]);
+    const BRAND = toUpper(row[idxBrand]);
+    const SITE  = row[idxSite];
+    const SALES = row[idxSales];
+    const QTY   = toNum(row[idxQty]) ?? 0;
+
+    let result='OK', detail='ผ่าน';
+    if(LD==null||DP==null||SUP==null){
+      result='Error'; detail='ข้อมูลไม่ครบ (LD/DP/Supply)';
+    }else if(!isBaseAllowed(LD,DP,SUP)){
+      result='Error'; detail='ไม่ตรง Mapping LD-DP-Supply ที่อนุญาต';
+    }else{
+      const {ok,msg}=checkBrandRule(LD,DP,SUP,BRAND);
+      if(!ok){result='Error'; detail=msg;} else detail=msg;
+    }
+
+    // นับ Error โดย "ไม่นับ" แถว DP = 90
+    if(result==='OK') okCount++;
+    else if(DP !== 90) errCount++;
+
+    processed.push({LD,DP,SUP,SITE,SALES,BRAND,QTY:QTY||0,result,detail});
+  }
+
+  // ชุดดาวน์โหลดผลตรวจ (ทุกแถว)
+  exportMatrix = [['LD','DP','Supply Site','Site','Salesperson','Brand','QTY(Order Unit)','Result','Detail']];
+  for(const p of processed){
+    exportMatrix.push([p.LD??'',p.DP??'',p.SUP??'',p.SITE??'',p.SALES??'',p.BRAND??'',p.QTY,p.result,p.detail]);
+  }
+
+  // แสดงผลตารางหลัก
+  renderTable();
+
+  // ---------- SUMMARY: Site × LD + Subtotal ต่อ Site ----------
+  const siteMap = new Map(); // site => { byLD: Map(ld => qty), total: number }
+  let grandTotal = 0;
+
+  for(const p of processed){
+    const site = String(p.SITE ?? '').trim() || '(blank)';
+    const ld   = (p.LD==null || p.LD==='') ? '(blank)' : String(p.LD);
+    const qty  = Number(p.QTY) || 0;
+
+    if(!siteMap.has(site)) siteMap.set(site,{byLD:new Map(), total:0});
+    const g = siteMap.get(site);
+    g.byLD.set(ld,(g.byLD.get(ld)||0)+qty);
+    g.total += qty;
+    grandTotal += qty;
+  }
+
+  summaryMatrix = [['Site','LD','Total Order Unit']];
+
+  let html = `<table>
+    <thead><tr><th>Site</th><th>LD</th><th>Total Order Unit</th></tr></thead><tbody>`;
+
+  const sortedSites = Array.from(siteMap.keys()).sort((a,b)=>String(a).localeCompare(String(b)));
+  for(const site of sortedSites){
+    const g = siteMap.get(site);
+    const rows = Array.from(g.byLD.entries())
+      .sort((a,b)=> (a[0]==='(blank)'?1:0) - (b[0]==='(blank)'?1:0) || Number(a[0]) - Number(b[0]));
+
+    for(const [ld,qty] of rows){
+      html += `<tr><td>${site}</td><td>${ld}</td><td>${Number(qty).toLocaleString()}</td></tr>`;
+      summaryMatrix.push([site, ld, qty]);
+    }
+    html += `<tr class="subtotal"><td>${site}</td><td>Subtotal</td><td>${Number(g.total).toLocaleString()}</td></tr>`;
+    summaryMatrix.push([site, 'Subtotal', g.total]);
+  }
+
+  html += `</tbody></table>`;
+  document.getElementById('summaryTable').innerHTML = html;
+  document.getElementById('sumHint').textContent = `รวม Order Unit ทั้งหมด: ${grandTotal.toLocaleString()}`;
+  document.getElementById('downloadSummaryBtn').disabled = false;
+
+  document.getElementById('summary').textContent =
+    `สรุปผลตรวจ: OK ${okCount} แถว • Error ${errCount} แถว (ไม่นับ DP=90) • รวม ${okCount+errCount} แถว`;
+  document.getElementById('downloadBtn').disabled = false;
+}
+
+function renderTable(){
+  if(!processed.length){ document.getElementById('result').innerHTML=''; return; }
+  const onlyErr = document.getElementById('onlyError').checked;
+
+  // ถ้า “แสดงเฉพาะ Error” ⇒ ซ่อน DP = 90
+  const rows = onlyErr
+    ? processed.filter(p=>p.result==='Error' && p.DP !== 90)
+    : processed;
+
+  let html = `<table><thead><tr>
+    <th>LD</th><th>DP</th><th>Supply Site</th><th>Site</th><th>Salesperson</th>
+    <th>Brand</th><th>QTY(Order Unit)</th><th>ผลตรวจ</th><th>รายละเอียด</th>
+  </tr></thead><tbody>`;
+
+  for(const p of rows){
+    html += `<tr class="${p.result==='OK'?'':'error'}">
+      <td>${p.LD??''}</td><td>${p.DP??''}</td><td>${p.SUP??''}</td><td>${p.SITE??''}</td><td>${p.SALES??''}</td>
+      <td>${p.BRAND??''}</td><td>${Number(p.QTY||0).toLocaleString()}</td>
+      <td>${p.result==='OK' ? '<span class="pill ok">OK</span>' : '<span class="pill err">Error</span>'}</td>
+      <td class="msg">${p.detail}</td>
+    </tr>`;
+  }
+  html += `</tbody></table>`;
+  document.getElementById('result').innerHTML = html;
+}
+
+/* -------------------- Export helpers -------------------- */
+function downloadXlsx(matrix, filename){
+  if(!matrix) return;
+  const ws = XLSX.utils.aoa_to_sheet(matrix);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+  XLSX.writeFile(wb, filename);
+}
+</script>
+</body>
+</html>
